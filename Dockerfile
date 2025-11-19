@@ -1,7 +1,7 @@
 # parameters
 ARG REPO_NAME="myduckiebot-core"
 ARG DESCRIPTION="virtual Duckiebot core functionalities"
-ARG MAINTAINER="ArushiGupta (arushigupt.23@gmail.com)"
+ARG MAINTAINER="Arushi Gupta (arushigupt.23@gmail.com)"
 # pick an icon from: https://fontawesome.com/v4.7.0/icons/
 ARG ICON="cube"
 
