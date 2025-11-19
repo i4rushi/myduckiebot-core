@@ -4,4 +4,7 @@ ros-noetic-cv-bridge
 libopencv-dev
 python3-opencv
 python3-numpy
-
+libturbojpeg0-dev
+ffmpeg
+libsm6
+libxext6

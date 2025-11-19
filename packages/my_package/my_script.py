@@ -1,84 +1,155 @@
 #!/usr/bin/env python3
-"""
-Lane keeping in gym-duckietown using visual servoing,
-with optional debug overlay for lane detection.
-"""
 
-import argparse
-import time
-import numpy as np
+import rospy
 import cv2
+import numpy as np
+from turbojpeg import TurboJPEG
 
-from gym_duckietown.simulator import Simulator
-from controller import LaneServoController
-from perception import detect_lane_markings
-from utils import make_debug_frame
+from duckietown.dtros import DTROS, NodeType
+from duckietown_msgs.msg import Twist2DStamped
+from sensor_msgs.msg import CompressedImage
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--map", default="udem1")
-    ap.add_argument("--steps", type=int, default=200000)
-    ap.add_argument("--no-gui", action="store_true")
-    ap.add_argument("--debug", action="store_true", help="Show OpenCV debug overlay")
-    ap.add_argument("--seed", type=int, default=123)
-    ap.add_argument("--domain-rand", type=int, default=0)
-    args = ap.parse_args()
+import os
 
-    env = Simulator(
-        seed=args.seed,
-        map_name=args.map,
-        max_steps=args.steps + 1,
-        domain_rand=int(bool(args.domain_rand)),
-        camera_width=640,
-        camera_height=480,
-        accept_start_angle_deg=4,
-        full_transparency=True,
-        distortion=False,
-    )
+HOST_NAME = os.environ["VEHICLE_NAME"]
 
-    obs = env.reset()
-    controller = LaneServoController(img_shape=obs.shape)
+# HSV mask for yellow lane
+ROAD_MASK = [(20, 60, 0), (50, 255, 255)]
+DEBUG = False
 
-    step = 0
 
-    try:
-        while True:
-            action = controller.compute_action(obs)
+class LaneFollowNode(DTROS):
 
-            """Handle traffic light with state machine"""
-            action, light_state = controller.handle_traffic_light(obs, action)
+    def __init__(self, node_name):
+        super(LaneFollowNode, self).__init__(node_name=node_name, node_type=NodeType.GENERIC)
 
-            """Handle stop sign with state machine"""
-            action, stop_state = controller.handle_stop_sign(obs, action)
+        self.veh = HOST_NAME
+        self.jpeg = TurboJPEG()
 
-            """Handle slow sign with state machine"""
-            action, slow_state = controller.handle_slow_sign(obs, action)
+        # PID control variables
+        self.offset = 220        # image center offset
+        self.velocity = 0.34
+        self.speed = 0.6
 
-            mask_left, mask_right = detect_lane_markings(obs)
+        self.twist = Twist2DStamped(v=self.velocity, omega=0)
+        self.proportional = None
 
-            obs, reward, done, info = env.step(action)
-            if not args.no_gui:
-                env.render()
+        self.P = 0.049
+        self.D = -0.004
+        self.last_error = 0
+        self.last_time = rospy.get_time()
 
-            if args.debug:
-                dbg = make_debug_frame(obs, mask_left, mask_right)
-                cv2.imshow("Lane Servo Debug", dbg)
-                if cv2.waitKey(1) & 0xFF == 27:  # ESC quits
-                    break
+        # ROS communication
+        if DEBUG:
+            self.pub = rospy.Publisher(f"/{self.veh}/output/image/mask/compressed",
+                                       CompressedImage, queue_size=1)
 
-            if done:
-                obs = env.reset()
-                # Reset state machines when episode resets
-                controller.traffic_light_state = "NORMAL"
-                controller.stop_sign_state = "NORMAL"
-                controller.slow_sign_state = "NORMAL"
-            step += 1
-    except KeyboardInterrupt:
-        pass
-    finally:
-        env.close()
-        if args.debug:
-            cv2.destroyAllWindows()
+        self.sub = rospy.Subscriber(f"/{self.veh}/camera_node/image/compressed",
+                                    CompressedImage, self.callback,
+                                    queue_size=1, buff_size="20MB")
 
+        self.vel_pub = rospy.Publisher(
+            f"/{self.veh}/car_cmd_switch_node/cmd",
+            Twist2DStamped,
+            queue_size=1
+        )
+
+        self.loginfo("Lane Following Node Initialized")
+
+    # ----------------------------------------------------------------------
+    # PROCESS CAMERA CALLBACK
+    # ----------------------------------------------------------------------
+    def callback(self, msg):
+        img = self.jpeg.decode(msg.data)
+
+        # Crop lower image (road area)
+        crop = img[300:, :, :]
+        crop_width = crop.shape[1]
+
+        # Convert to HSV and mask yellow lane
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, ROAD_MASK[0], ROAD_MASK[1])
+
+        contours, _ = cv2.findContours(mask,
+                                       cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_NONE)
+
+        # Find largest contour as lane line
+        max_area = 20
+        max_idx = -1
+        for i in range(len(contours)):
+            area = cv2.contourArea(contours[i])
+            if area > max_area:
+                max_idx = i
+                max_area = area
+
+        if max_idx != -1:
+            # Compute centroid for steering error
+            M = cv2.moments(contours[max_idx])
+            try:
+                cx = int(M['m10'] / M['m00'])
+                self.proportional = cx - (crop_width // 2) + self.offset
+            except:
+                self.proportional = 0
+        else:
+            # If no lane found, assume drifting right
+            self.proportional = -100
+
+        # Publish debug image
+        if DEBUG:
+            debug_msg = CompressedImage(
+                format="jpeg",
+                data=self.jpeg.encode(crop)
+            )
+            self.pub.publish(debug_msg)
+
+    # ----------------------------------------------------------------------
+    # PID + DRIVING
+    # ----------------------------------------------------------------------
+    def drive(self):
+        if self.proportional is None:
+            self.twist.omega = 0
+            self.twist.v = self.velocity
+            self.vel_pub.publish(self.twist)
+            return
+
+        # P term
+        P_term = -self.proportional * self.P
+
+        # D term
+        dt = rospy.get_time() - self.last_time
+        d_error = (self.proportional - self.last_error) / dt
+        D_term = d_error * self.D
+
+        self.last_error = self.proportional
+        self.last_time = rospy.get_time()
+
+        self.twist.v = self.velocity
+        self.twist.omega = P_term + D_term
+
+        if DEBUG:
+            self.loginfo(f"P={P_term}, D={D_term}, Omega={self.twist.omega}")
+
+        self.vel_pub.publish(self.twist)
+
+    # ----------------------------------------------------------------------
+    # SHUTDOWN
+    # ----------------------------------------------------------------------
+    def hook(self):
+        self.twist.v = 0
+        self.twist.omega = 0
+        for _ in range(8):
+            self.vel_pub.publish(self.twist)
+        print("SHUTTING DOWN")
+
+
+# -----------------------------------------------------------------------------
+# MAIN LOOP
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    node = LaneFollowNode("lanefollow_node_clean")
+    rate = rospy.Rate(8)
+
+    while not rospy.is_shutdown():
+        node.drive()
+        rate.sleep()
