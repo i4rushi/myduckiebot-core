@@ -1,6 +1,1 @@
 # LIST YOUR PYTHON3 PACKAGES HERE
-rospy
-numpy
-cv2
-cv_bridge
-duckietown-utils
